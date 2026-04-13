@@ -1,0 +1,698 @@
+//PROGRAM CODE
+
+// Steering control using mapped CAN source slots.
+
+int32 steering_target;
+int32 steering_target_prev;
+int32 steering_target_rate;
+int32 steering_target_lead;
+int32 target_delay_ticks;
+int32 steering_error_base;
+int32 steering_error_lead;
+int32 steering_angle;
+int32 steering_error;
+int32 steering_error_prev;
+int32 steering_error_deadzone;
+int32 steering_error_deadzone_use;
+int32 steering_prev_angle;
+int32 steering_p;
+int32 steering_i;
+int32 steering_i_accum;
+int32 steering_d;
+int32 steering_torque;
+int32 steering_torque_prev;
+int32 steering_torque_raw_cmd;
+int32 steering_cmd_filt_q8;
+int32 steering_cmd_filter_shift;
+int32 steering_cmd_filter_shift_slow;
+int32 steering_cmd_filter_shift_use;
+int32 steering_filter_error_threshold;
+int32 steering_mode;
+int32 softoff_step;
+int32 command_counter;
+int32 pid_i_delta;
+int32 pid_sum;
+int32 steering_ff_cmd;
+int32 steering_ff_gain;
+int32 steering_ff_abs_limit;
+int32 steering_bias_learn;
+int32 steering_bias_cmd;
+int32 steering_bias_abs_limit;
+int32 steering_bias_learn_step;
+int32 steering_bias_error_window;
+int32 steering_bias_speed_limit;
+int32 steering_bias_stable_count;
+int32 steering_bias_stable_count_min;
+int32 steering_target_reached;
+int32 duty_min;
+int32 duty_max;
+int32 i_min;
+int32 i_max;
+int32 i_min_q8;
+int32 i_max_q8;
+int32 softoff_abs0;
+int32 softoff_abs1;
+int32 tx_mode_counter;
+int32 tx_angle_raw;
+int32 tx_torque_raw;
+int32 tx_checksum_accum;
+int32 wheel_fl_raw;
+int32 wheel_fl_kph_q4;
+int32 cruise_plus1;
+int32 cruise_plus5;
+int32 cruise_minus1;
+int32 cruise_minus5;
+int32 cruise_cancel_lever_up;
+int32 dsc_full_off;
+int32 dtc_on;
+int32 brake_pressure;
+int32 engage_cmd;
+int32 engage_cmd_prev;
+int32 setspeed_cmd;
+int32 tx100_setspeed_raw;
+int32 op_steer_angle_target;
+int32 op_engaged;
+int32 steering_position_raw;
+int32 steering_status_angle_raw;
+int32 steering_status_speed_raw;
+int32 steering_status_torque_raw;
+int32 steering_status_control_status;
+int32 steering_status_counter;
+int32 steering_status_mode_counter_raw;
+int32 steering_status_checksum;
+int32 steering_status_temperature_raw;
+int32 steering_status_debug_states;
+int32 steering_target_abs;
+int32 steering_torque_limit_target;
+int32 map_count;
+int32 idx;
+int32 x0;
+int32 y0;
+int32 x1;
+int32 y1;
+int32 dx;
+int32 interp;
+int32 map_idx_x;
+int32 map_idx_y;
+int32 steering_speed_abs;
+int32 torque_rate_limit_step;
+int32 torque_rate_step_min;
+int32 torque_rate_step_max;
+int32 straight_hold_target_abs_limit;
+int32 straight_hold_error_limit;
+int32 straight_hold_speed_limit;
+int32 mode_off;
+int32 mode_torque;
+int32 mode_angle;
+int32 mode_softoff;
+int32 steering_step_cmd;
+int32 steering_commanded_step;
+
+uint8 tx100buf[8];
+uint8 txbuf[5];
+uint8 tx_checksum;
+
+function abs32(int32 in) {
+	if(in < 0) {
+		return(0 - in);
+	}
+	return(in);
+}
+
+function limit(int32 in, int32 lo, int32 hi) {
+	if(in < lo) {
+		return(lo);
+	}
+	if(in > hi) {
+		return(hi);
+	}
+	return(in);
+}
+
+function to_s16(int32 in) {
+	in = in & 0xFFFF;
+	if(in >= 0x8000) {
+		return(in - 0x10000);
+	}
+	return(in);
+}
+
+function to_s8(int32 in) {
+	in = in & 0xFF;
+	if(in >= 0x80) {
+		return(in - 0x100);
+	}
+	return(in);
+}
+
+function q8_mul_round(int32 value, int32 gain) {
+	value = value * gain;
+	if(value >= 0) {
+		return(wraps16((value + 128) >> 8));
+	}
+	return(wraps16((value - 128) >> 8));
+}
+
+function ramp_to_zero(int32 in, int32 step) {
+	if(in > step) {
+		return(in - step);
+	}
+	if(in < (0 - step)) {
+		return(in + step);
+	}
+	return(0);
+}
+
+function lookup_target_torque_limit(int32 target_abs) {
+	map_count = 8;
+	x0 = conf.targettorqueaxis[0];
+	y0 = conf.targettorquelimit[0];
+	y0 = limit(y0, 0, 127);
+	if(target_abs <= x0) {
+		return(y0);
+	}
+
+	idx = 1;
+	while(idx < map_count) {
+		x1 = conf.targettorqueaxis[idx];
+		y1 = conf.targettorquelimit[idx];
+		y1 = limit(y1, 0, 127);
+		if(target_abs <= x1) {
+			dx = x1 - x0;
+			if(dx <= 0) {
+				return(y1);
+			}
+			interp = y0 + (((target_abs - x0) * (y1 - y0)) / dx);
+			return(limit(interp, 0, 127));
+		}
+		x0 = x1;
+		y0 = y1;
+		idx = idx + 1;
+	}
+
+	return(y0);
+}
+
+function reset_pid_state() {
+	steering_i = 0;
+	steering_i_accum = 0;
+	steering_p = 0;
+	steering_d = 0;
+	steering_error = 0;
+	steering_prev_angle = steering_angle;
+}
+
+function apply_mode_torque() {
+	duty_min = limit(conf.dutyrange[0], -127, 0);
+	duty_max = limit(conf.dutyrange[1], 0, 127);
+	if(duty_min > duty_max) {
+		duty_min = -127;
+		duty_max = 127;
+	}
+
+	i_min = limit(conf.Irange[0], -127, 0);
+	i_max = limit(conf.Irange[1], 0, 127);
+	if(i_min > i_max) {
+		i_min = duty_min;
+		i_max = duty_max;
+	}
+	i_min_q8 = i_min << 8;
+	i_max_q8 = i_max << 8;
+	steering_target_abs = abs32(steering_target);
+	steering_torque_limit_target = lookup_target_torque_limit(steering_target_abs);
+	if(duty_max > steering_torque_limit_target) {
+		duty_max = steering_torque_limit_target;
+	}
+	if(duty_min < (0 - steering_torque_limit_target)) {
+		duty_min = 0 - steering_torque_limit_target;
+	}
+	if(i_max > duty_max) {
+		i_max = duty_max;
+	}
+	if(i_min < duty_min) {
+		i_min = duty_min;
+	}
+	i_min_q8 = i_min << 8;
+	i_max_q8 = i_max << 8;
+	steering_error_deadzone_use = steering_error_deadzone;
+	if(abs32(steering_angle) > 10) {
+		steering_error_deadzone_use = 1;
+	}
+
+	steering_error = steering_target - steering_angle;
+	if(abs32(steering_error) <= steering_error_deadzone_use) {
+		steering_error = 0;
+		steering_target_reached = 1;
+	} else {
+		steering_target_reached = 0;
+	}
+	// Avoid repeatedly collapsing I on tiny quantization sign flips around center.
+	if((steering_error > 0) && (steering_error_prev < 0)) {
+		if((abs32(steering_error) > (steering_error_deadzone_use + 1)) && (abs32(steering_error_prev) > (steering_error_deadzone_use + 1))) {
+			steering_i_accum = (steering_i_accum * 3) >> 2;
+		}
+	}
+	if((steering_error < 0) && (steering_error_prev > 0)) {
+		if((abs32(steering_error) > (steering_error_deadzone_use + 1)) && (abs32(steering_error_prev) > (steering_error_deadzone_use + 1))) {
+			steering_i_accum = (steering_i_accum * 3) >> 2;
+		}
+	}
+	steering_error_prev = steering_error;
+	steering_p = q8_mul_round(steering_error, conf.steeringkp);
+	if(steering_target_reached == 1) {
+		steering_p = 0;
+	} else {
+		// Avoid a zero P output when small non-zero error is rounded away in Q8 math.
+		if((steering_p == 0) && (steering_error != 0) && (conf.steeringkp != 0)) {
+			if(steering_error > 0) {
+				steering_p = 1;
+			} else {
+				steering_p = -1;
+			}
+		}
+	}
+	steering_d = q8_mul_round(steering_prev_angle - steering_angle, conf.steeringkd);
+	steering_prev_angle = steering_angle;
+
+	pid_i_delta = steering_error * conf.steeringki;
+	if(steering_target_reached == 1) {
+		pid_i_delta = 0;
+		// Bleed residual I near target so it does not keep pushing and cause pingpong.
+		steering_i_accum = ramp_to_zero(steering_i_accum, 48);
+	}
+	steering_i = wraps16(steering_i_accum >> 8);
+	pid_sum = steering_p + steering_i;
+	pid_sum = pid_sum + steering_d;
+	if(pid_sum >= duty_max) {
+		if(pid_i_delta > 0) {
+			pid_i_delta = 0;
+		}
+	}
+	if(pid_sum <= duty_min) {
+		if(pid_i_delta < 0) {
+			pid_i_delta = 0;
+		}
+	}
+
+	steering_i_accum = steering_i_accum + pid_i_delta;
+	steering_i_accum = limit(steering_i_accum, i_min_q8, i_max_q8);
+	steering_i = wraps16(steering_i_accum >> 8);
+	pid_sum = steering_p + steering_i;
+	pid_sum = pid_sum + steering_d;
+	steering_ff_cmd = q8_mul_round(steering_target_rate, steering_ff_gain);
+	steering_ff_cmd = limit(steering_ff_cmd, (0 - steering_ff_abs_limit), steering_ff_abs_limit);
+ 	pid_sum = pid_sum + steering_ff_cmd;
+
+	// Learn a small torque bias in steady near-center tracking to compensate friction/alignment pull.
+	if(steering_target_abs <= straight_hold_target_abs_limit) {
+		if(abs32(steering_status_speed_raw) <= steering_bias_speed_limit) {
+			if(abs32(steering_target_rate) <= 1) {
+				if(abs32(steering_error) >= steering_bias_error_window) {
+					if(abs32(steering_error) <= (steering_bias_error_window + 6)) {
+						steering_bias_stable_count = steering_bias_stable_count + 1;
+						if(steering_bias_stable_count >= steering_bias_stable_count_min) {
+							if(steering_error > 0) {
+								steering_bias_learn = steering_bias_learn + steering_bias_learn_step;
+							} else {
+								steering_bias_learn = steering_bias_learn - steering_bias_learn_step;
+							}
+							steering_bias_learn = limit(steering_bias_learn, (0 - steering_bias_abs_limit), steering_bias_abs_limit);
+							steering_bias_stable_count = 0;
+						}
+					} else {
+						steering_bias_stable_count = 0;
+					}
+				} else {
+					steering_bias_stable_count = 0;
+				}
+			} else {
+				steering_bias_stable_count = 0;
+			}
+		} else {
+			steering_bias_stable_count = 0;
+		}
+	} else {
+		steering_bias_stable_count = 0;
+	}
+
+	steering_bias_cmd = steering_bias_learn;
+	pid_sum = pid_sum + steering_bias_cmd;
+	steering_torque_raw_cmd = limit(pid_sum, duty_min, duty_max);
+	steering_torque = steering_torque_raw_cmd;
+	steering_cmd_filt_q8 = steering_torque << 8;
+	steering_torque = limit(steering_torque, duty_min, duty_max);
+	// Do not command torque that increases absolute tracking error.
+	if(steering_error > steering_error_deadzone_use) {
+		if(steering_torque < 0) {
+			steering_torque = 0;
+		}
+	}
+	if(steering_error < (0 - steering_error_deadzone_use)) {
+		if(steering_torque > 0) {
+			steering_torque = 0;
+		}
+	}
+
+	// Slew-limit torque command, but keep enough authority during curves.
+	steering_speed_abs = abs32(steering_status_speed_raw);
+	torque_rate_limit_step = torque_rate_step_max - (steering_speed_abs >> 3);
+	torque_rate_limit_step = limit(torque_rate_limit_step, torque_rate_step_min, torque_rate_step_max);
+	softoff_step = torque_rate_limit_step;
+	if(abs32(steering_error) > (steering_error_deadzone_use + 2)) {
+		softoff_step = softoff_step >> 1;
+		if(softoff_step < 1) {
+			softoff_step = 1;
+		}
+	}
+	if(steering_torque > (steering_torque_prev + torque_rate_limit_step)) {
+		steering_torque = steering_torque_prev + torque_rate_limit_step;
+	}
+	if(steering_torque < (steering_torque_prev - softoff_step)) {
+		steering_torque = steering_torque_prev - softoff_step;
+	}
+	steering_torque = limit(steering_torque, duty_min, duty_max);
+	// Near straight target and near-zero motion, neutralize tiny hunt torque.
+	if(steering_target_abs <= straight_hold_target_abs_limit) {
+		if(abs32(steering_error) <= straight_hold_error_limit) {
+			if(abs32(steering_status_speed_raw) <= straight_hold_speed_limit) {
+				if(abs32(steering_target_rate) <= 1) {
+					steering_torque = ramp_to_zero(steering_torque, 1);
+					steering_torque_prev = steering_torque;
+					steering_cmd_filt_q8 = steering_torque << 8;
+					steering_i_accum = ramp_to_zero(steering_i_accum, 80);
+				}
+			}
+		}
+	}
+	steering_torque_prev = steering_torque;
+}
+
+function apply_mode_softoff() {
+	softoff_abs1 = abs32(conf.dutyrange[1]);
+	softoff_abs0 = abs32(conf.dutyrange[0]);
+	softoff_step = softoff_abs1;
+	if(softoff_abs0 > softoff_step) {
+		softoff_step = softoff_abs0;
+	}
+	softoff_step = softoff_step / 50;
+	if(softoff_step < 1) {
+		softoff_step = 1;
+	}
+	steering_torque = ramp_to_zero(steering_torque, softoff_step);
+	steering_cmd_filt_q8 = steering_torque << 8;
+	steering_torque_prev = steering_torque;
+	reset_pid_state();
+}
+
+function apply_mode_idle() {
+	steering_torque = 0;
+	steering_cmd_filt_q8 = 0;
+	steering_torque_prev = 0;
+	reset_pid_state();
+}
+
+function send_steering_command() {
+	command_counter = (command_counter + 1) & 0x0F;
+	tx_mode_counter = command_counter;
+	if(steering_mode == mode_torque) {
+		tx_mode_counter = tx_mode_counter | ((4 & 0x0F) << 4);
+	} else {
+		tx_mode_counter = tx_mode_counter | ((0 & 0x0F) << 4);
+	}
+	tx_angle_raw = 0;
+	steering_step_cmd = limit(steering_torque, -127, 127);
+	if(steering_step_cmd == 0) {
+		tx_torque_raw = 0;
+	} else {
+		tx_torque_raw = (abs32(steering_step_cmd) + 4) / 8;
+		if(tx_torque_raw < 1) {
+			tx_torque_raw = 1;
+		}
+		if(steering_step_cmd < 0) {
+			tx_torque_raw = 0 - tx_torque_raw;
+		}
+		tx_torque_raw = limit(tx_torque_raw, -8, 8);
+		tx_torque_raw = tx_torque_raw << 3;
+	}
+
+	txbuf[1] = tx_mode_counter & 0xFF;
+	txbuf[2] = tx_angle_raw & 0xFF;
+	txbuf[3] = (tx_angle_raw >> 8) & 0xFF;
+	txbuf[4] = tx_torque_raw & 0xFF;
+	tx_checksum_accum = 0x22E + txbuf[1] + txbuf[2] + txbuf[3] + txbuf[4];
+	tx_checksum_accum = (tx_checksum_accum & 0xFF) + (tx_checksum_accum >> 8);
+	tx_checksum = tx_checksum_accum & 0xFF;
+	txbuf[0] = tx_checksum;
+	can1_tx(0x22E, 5, txbuf);
+	steering_commanded_step = to_s8(tx_torque_raw) / 8;
+
+	rt.commandcounter = command_counter;
+	rt.commandvalid = 1;
+}
+
+function send_engage_setspeed_command() {
+	rt.engage = engage_cmd;
+	rt.setspeed = setspeed_cmd;
+
+	// Convert wheel speed command from Q4 kph to 1 kph/bit before TX.
+	tx100_setspeed_raw = (setspeed_cmd + 8) / 16;
+	tx100_setspeed_raw = limit(tx100_setspeed_raw, 0, 255);
+	tx100buf[0] = engage_cmd & 0xFF;
+	tx100buf[1] = tx100_setspeed_raw & 0xFF;
+	tx100buf[2] = 0;
+	tx100buf[3] = 0;
+	tx100buf[4] = 0;
+	tx100buf[5] = 0;
+	tx100buf[6] = 0;
+	tx100buf[7] = 0;
+	can2_tx(0x100, 8, tx100buf);
+}
+
+function read_inputs_from_can_sources() {
+	// Map these in ECU config to the desired CAN signals.
+	// can2src0: steering wheel angle raw (0.04395 deg/bit signed)
+	// can2src1: openpilot steer angle target raw (0.1 deg/bit signed)
+	// can2src2: openpilot engaged flag
+	// can2src3: front-left wheel speed (Q4 kph)
+	// can2src4..can2src8: cruise plus1/plus5/minus1/minus5/cancelLeverUp
+	// can2src9..can2src11: dsc full off / dtc on / brake pressure
+	// can1src12..can1src19: steering_status on 0x22F
+
+	steering_position_raw = to_s16(rt.can2src0);
+	steering_angle = (steering_position_raw * 4395) / 10000;
+
+	op_steer_angle_target = to_s16(rt.can2src1);
+	op_engaged = rt.can2src2 & 1;
+	engage_cmd = op_engaged;
+
+	wheel_fl_raw = wraps16(rt.can2src3);
+	wheel_fl_kph_q4 = wheel_fl_raw;
+
+	cruise_plus1 = rt.can2src4 & 1;
+	cruise_plus5 = rt.can2src5 & 1;
+	cruise_minus1 = rt.can2src6 & 1;
+	cruise_minus5 = rt.can2src7 & 1;
+	cruise_cancel_lever_up = rt.can2src8 & 1;
+
+	dsc_full_off = rt.can2src9;
+	dtc_on = rt.can2src10 & 1;
+	brake_pressure = wraps8(rt.can2src11);
+
+	steering_status_angle_raw = to_s16(rt.can1src0);
+	steering_status_speed_raw = to_s8(rt.can1src1);
+	steering_status_torque_raw = to_s8(rt.can1src2);
+	steering_status_mode_counter_raw = wraps8(rt.can1src3);
+	steering_status_control_status = (steering_status_mode_counter_raw >> 4) & 0x0F;
+	steering_status_counter = steering_status_mode_counter_raw & 0x0F;
+	if((rt.can1src3 & 0xFFFFFFF0) == 0) {
+		if((rt.can1src4 & 0xFFFFFFF0) == 0) {
+			steering_status_control_status = rt.can1src3 & 0x0F;
+			steering_status_counter = rt.can1src4 & 0x0F;
+		}
+	}
+	steering_status_checksum = rt.can1src5 & 0xFF;
+	steering_status_temperature_raw = rt.can1src6 & 0xFF;
+	steering_status_debug_states = rt.can1src7 & 0xFF;
+
+	if(cruise_plus1 == 1) {
+		engage_cmd = 1;
+		setspeed_cmd = wheel_fl_kph_q4;
+	}
+	if(cruise_cancel_lever_up == 1) {
+		engage_cmd = 0;
+	}
+
+	rt.wheelspeedfl = wheel_fl_kph_q4;
+	rt.cruiseplus1 = cruise_plus1;
+	rt.cruiseplus5 = cruise_plus5;
+	rt.cruiseminus1 = cruise_minus1;
+	rt.cruiseminus5 = cruise_minus5;
+	rt.cruisecancelleverup = cruise_cancel_lever_up;
+	rt.dscfulloff = dsc_full_off;
+	rt.dtcon = dtc_on;
+	rt.brakepressure = brake_pressure;
+	rt.opsteerangletarget = op_steer_angle_target;
+	rt.opengaged = op_engaged;
+	rt.steeringstatusangle = steering_status_angle_raw;
+	rt.steeringstatusspeed = steering_status_speed_raw;
+	rt.steeringstatustorque = steering_status_torque_raw;
+	rt.steeringstatuscontrol = steering_status_control_status & 1;
+	rt.steeringstatuscounter = steering_status_counter;
+	rt.steeringstatuschecksum = steering_status_checksum;
+	rt.steeringstatustemperature = steering_status_temperature_raw;
+	rt.steeringstatusdebugstates = steering_status_debug_states;
+}
+
+function compute_steering_control() {
+	read_inputs_from_can_sources();
+	if((engage_cmd == 1) && (engage_cmd_prev == 0)) {
+		reset_pid_state();
+		steering_torque_prev = 0;
+		steering_bias_stable_count = 0;
+	}
+
+	target_delay_ticks = limit(conf.targetdelayticks, 0, 20);
+	steering_target_rate = op_steer_angle_target - steering_target_prev;
+	steering_error_base = op_steer_angle_target - steering_angle;
+	steering_target_lead = op_steer_angle_target + (steering_target_rate * target_delay_ticks);
+	steering_target = limit(steering_target_lead, -32768, 32767);
+	steering_error_lead = steering_target - steering_angle;
+	// Use lead only when it keeps/increases error in the same direction.
+	if((steering_error_base > 0) && (steering_error_lead <= 0)) {
+		steering_target = op_steer_angle_target;
+	}
+	if((steering_error_base < 0) && (steering_error_lead >= 0)) {
+		steering_target = op_steer_angle_target;
+	}
+	if(abs32(steering_error_lead) < abs32(steering_error_base)) {
+		steering_target = op_steer_angle_target;
+	}
+	steering_target_prev = op_steer_angle_target;
+	if(engage_cmd == 1) {
+		steering_mode = mode_torque;
+	} else {
+		steering_mode = mode_off;
+	}
+	if(abs32(wheel_fl_kph_q4) < 320) {
+		if(abs32(steering_target) > 100) {
+			steering_mode = mode_off;
+		}
+	}
+
+	if(steering_mode == mode_torque) {
+		apply_mode_torque();
+	} else {
+		if(steering_mode == mode_softoff) {
+			apply_mode_softoff();
+		} else {
+			apply_mode_idle();
+		}
+	}
+
+	send_steering_command();
+	send_engage_setspeed_command();
+
+	rt.steeringtarget = steering_target;
+	rt.steeringangle = steering_angle;
+	rt.steeringerror = steering_error;
+	rt.steeringP = steering_p;
+	rt.steeringI = steering_i;
+	rt.steeringD = steering_d;
+	rt.steeringmode = steering_mode;
+	rt.steertorquecmd = tx_torque_raw;
+	rt.steeringcommandedstep = steering_commanded_step;
+	rt.steeringtorque = steering_torque;
+	engage_cmd_prev = engage_cmd;
+}
+
+function cb100() {
+	compute_steering_control();
+}
+
+function init() {
+	mode_off = 0;
+	mode_torque = 1;
+	mode_angle = 2;
+	mode_softoff = 3;
+	steering_error_deadzone = 1;
+	steering_ff_gain = 60;
+	steering_ff_abs_limit = 10;
+	steering_bias_abs_limit = 10;
+	steering_bias_learn_step = 1;
+	steering_bias_error_window = 1;
+	steering_bias_speed_limit = 4;
+	steering_bias_stable_count_min = 24;
+	torque_rate_step_min = 2;
+	torque_rate_step_max = 5;
+	straight_hold_target_abs_limit = 25;
+	straight_hold_error_limit = 1;
+	straight_hold_speed_limit = 2;
+	rt.commandvalid = 0;
+	callback_100hz = cb100;
+	steering_mode = mode_softoff;
+	command_counter = 0;
+	tx_mode_counter = 0;
+	tx_angle_raw = 0;
+	tx_torque_raw = 0;
+	wheel_fl_raw = 0;
+	wheel_fl_kph_q4 = 0;
+	cruise_plus1 = 0;
+	cruise_plus5 = 0;
+	cruise_minus1 = 0;
+	cruise_minus5 = 0;
+	cruise_cancel_lever_up = 0;
+	dsc_full_off = 0;
+	dtc_on = 0;
+	brake_pressure = 0;
+	engage_cmd = 0;
+	engage_cmd_prev = 0;
+	setspeed_cmd = 0;
+	tx100_setspeed_raw = 0;
+	op_steer_angle_target = 0;
+	op_engaged = 0;
+	steering_torque_raw_cmd = 0;
+	steering_torque_prev = 0;
+	steering_cmd_filt_q8 = 0;
+	steering_position_raw = 0;
+	steering_target_reached = 0;
+	steering_speed_abs = 0;
+	torque_rate_limit_step = 0;
+	steering_target_prev = 0;
+	steering_target_rate = 0;
+	steering_target_lead = 0;
+	steering_error_base = 0;
+	steering_error_lead = 0;
+	target_delay_ticks = 0;
+	steering_ff_cmd = 0;
+	steering_bias_learn = 0;
+	steering_bias_cmd = 0;
+	steering_bias_stable_count = 0;
+	steering_error_prev = 0;
+	steering_i_accum = 0;
+	steering_status_angle_raw = 0;
+	steering_status_speed_raw = 0;
+	steering_status_torque_raw = 0;
+	steering_status_control_status = 0;
+	steering_status_counter = 0;
+	steering_status_checksum = 0;
+	steering_status_temperature_raw = 0;
+	steering_status_debug_states = 0;
+	steering_target_abs = 0;
+	steering_torque_limit_target = 0;
+	steering_step_cmd = 0;
+	steering_commanded_step = 0;
+	tx100buf[0] = 0;
+	tx100buf[1] = 0;
+	tx100buf[2] = 0;
+	tx100buf[3] = 0;
+	tx100buf[4] = 0;
+	tx100buf[5] = 0;
+	tx100buf[6] = 0;
+	tx100buf[7] = 0;
+	txbuf[0] = 0;
+	txbuf[1] = 0;
+	txbuf[2] = 0;
+	txbuf[3] = 0;
+	txbuf[4] = 0;
+	tx_checksum = 0;
+}

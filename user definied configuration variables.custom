@@ -1,0 +1,49 @@
+
+[
+  {
+    "name":"Steering torque control",
+    "type":255,
+    "value":[
+      {
+        "name":"Output duty clamp range",
+        "type":4,
+        "id":"dutyrange"
+      },
+      {
+        "name":"Integral clamp range",
+        "type":4,
+        "id":"Irange"
+      },
+      {
+        "name":"Steering Kp (Q8)",
+        "id":"steeringkp"
+      },
+      {
+        "name":"Steering Ki (Q8)",
+        "id":"steeringki"
+      },
+      {
+        "name":"Steering Kd (Q8)",
+        "id":"steeringkd"
+      },
+      {
+        "name":"Target delay compensation ticks (10ms each)",
+        "id":"targetdelayticks",
+        "value":4
+      },
+      {
+        "name":"Target angle breakpoints",
+        "id":"targettorqueaxis",
+        "type":4,
+        "value":[0, 5, 10, 20, 35, 50, 80, 120]
+      },
+      {
+        "name":"Target angle -> max torque table",
+        "id":"targettorquelimit",
+        "type":5,
+        "xaxis":"targettorqueaxis",
+        "value":[20, 28, 36, 50, 70, 90, 110, 127]
+      }
+    ]
+  }
+]
